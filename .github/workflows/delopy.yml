@@ -1,0 +1,124 @@
+name: Build and Deploy Vaultwarden with Nginx
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  TARGET_DIR: /opt/vaultwarden
+  BINARY_NAME: vaultwarden
+  SERVICE_NAME: vaultwarden
+  VAULT_PORT: 8080
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Upload binary to VPS
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          source: "target/release/${{ env.BINARY_NAME }}"
+          target: ${{ env.TARGET_DIR }}/
+          strip_components: 2
+
+      - name: Setup Vaultwarden + Nginx and restart
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            set -e
+
+            # ---------- 1. Vaultwarden 目录 ----------
+            mkdir -p ${{ env.TARGET_DIR }}
+
+            # ---------- 2. systemd 服务 ----------
+            SERVICE_FILE="/etc/systemd/system/${{ env.SERVICE_NAME }}.service"
+            if [ ! -f "$SERVICE_FILE" ]; then
+              echo "📝 创建 Vaultwarden 服务..."
+              sudo tee "$SERVICE_FILE" > /dev/null << 'SERVICEEOF'
+            [Unit]
+            Description=Vaultwarden (Bitwarden Compatible Server)
+            After=network.target
+
+            [Service]
+            Type=simple
+            User=root
+            Group=root
+            WorkingDirectory=/opt/vaultwarden
+            ExecStart=/opt/vaultwarden/vaultwarden
+
+            Environment=ROCKET_ADDRESS=127.0.0.1
+            Environment=ROCKET_PORT=8080
+            Environment=ROCKET_WORKERS=2
+            Environment=WEBSOCKET_ENABLED=false
+
+            Restart=always
+            RestartSec=10
+
+            NoNewPrivileges=yes
+            PrivateTmp=yes
+
+            [Install]
+            WantedBy=multi-user.target
+            SERVICEEOF
+              sudo systemctl daemon-reload
+              sudo systemctl enable ${{ env.SERVICE_NAME }}
+            fi
+
+            # ---------- 3. 安装 Nginx（Debian） ----------
+            if ! command -v nginx &> /dev/null; then
+              echo "📦 安装 Nginx..."
+              sudo apt update -qq
+              sudo apt install -y -qq nginx
+            fi
+
+            # ---------- 4. Nginx 反代配置 ----------
+            NGINX_CONF="/etc/nginx/conf.d/vaultwarden.conf"
+            if [ ! -f "$NGINX_CONF" ]; then
+              echo "📝 写入 Nginx 配置..."
+              sudo tee "$NGINX_CONF" > /dev/null << 'NGINXEOF'
+            server {
+                listen 80;
+                server_name _;
+                access_log /var/log/nginx/vaultwarden_access.log;
+                error_log  /var/log/nginx/vaultwarden_error.log;
+                location / {
+                    proxy_pass http://127.0.0.1:8080;
+                    proxy_set_header Host $host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto $scheme;
+                }
+            }
+            NGINXEOF
+            fi
+
+            # ---------- 5. 重启所有服务 ----------
+            sudo systemctl restart ${{ env.SERVICE_NAME }}
+            sudo systemctl enable nginx --now
+            sudo systemctl reload nginx || sudo systemctl restart nginx
+
+            echo "✅ 部署完成！现在可以通过 http://$(hostname -I | awk '{print $1}') 访问 Vaultwarden"
