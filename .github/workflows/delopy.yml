@@ -1,9 +1,14 @@
-name: Build and Deploy Vaultwarden with Nginx
+name: Build and Deploy Vaultwarden
 
 on:
-  push:
-    branches: [ "main" ]
   workflow_dispatch:
+  schedule:
+    - cron: "0 8 1 * *"
+      timezone: "Asia/Shanghai"
+
+concurrency:
+  group: vaultwarden-deploy
+  cancel-in-progress: false
 
 env:
   TARGET_DIR: /opt/vaultwarden
@@ -12,13 +17,97 @@ env:
   VAULT_PORT: 8080
 
 jobs:
-  build-and-deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+  check-version:
+    runs-on: ubuntu-24.04
+    outputs:
+      need_deploy: ${{ steps.check.outputs.need_deploy }}
+      vaultwarden_tag: ${{ steps.versions.outputs.vaultwarden_tag }}
+      web_vault_tag: ${{ steps.versions.outputs.web_vault_tag }}
+      web_vault_url: ${{ steps.versions.outputs.web_vault_url }}
 
-      - name: Build Vaultwarden binary inside Debian 12
+    steps:
+      - name: 获取最新版号
+        id: versions
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+          VW_JSON="$(curl -fsSL --retry 3 --retry-delay 5 https://api.github.com/repos/dani-garcia/vaultwarden/releases/latest)"
+          VW_TAG="$(echo "$VW_JSON" | jq -r '.tag_name')"
+
+          WEB_JSON="$(curl -fsSL --retry 3 --retry-delay 5 https://api.github.com/repos/dani-garcia/bw_web_builds/releases/latest)"
+          WEB_TAG="$(echo "$WEB_JSON" | jq -r '.tag_name')"
+          WEB_ASSET_URL="$(echo "$WEB_JSON" | jq -r --arg tag "$WEB_TAG" '.assets[] | select(.name == ("bw_web_" + $tag + ".tar.gz")) | .browser_download_url' | head -n1)"
+
+          if [ -z "$WEB_ASSET_URL" ] || [ "$WEB_ASSET_URL" = "null" ]; then
+            echo "没有找到 web-vault 下载地址"
+            echo "$WEB_JSON" | jq -r '.assets[].name'
+            exit 1
+          fi
+          
+          echo "vaultwarden_tag=$VW_TAG" >> "$GITHUB_OUTPUT"
+          echo "web_vault_tag=$WEB_TAG" >> "$GITHUB_OUTPUT"
+          echo "web_vault_url=$WEB_ASSET_URL" >> "$GITHUB_OUTPUT"
+
+      - name: 检查 VPS 当前版本
+        id: check
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          SSH_CMD="ssh -6 -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT }} -o StrictHostKeyChecking=no ${{ secrets.SSH_USERNAME }}@${{ secrets.SSH_HOST }}"
+
+          OLD_SERVER_VERSION="$($SSH_CMD 'cat /opt/vaultwarden/.deployed_version 2>/dev/null || echo none')"
+          OLD_WEB_VERSION="$($SSH_CMD 'cat /opt/vaultwarden/.web_vault_version 2>/dev/null || echo none')"
+          SERVICE_ACTIVE="$($SSH_CMD 'systemctl is-active vaultwarden 2>/dev/null || true')"
+
+          NEW_SERVER_VERSION="${{ steps.versions.outputs.vaultwarden_tag }}"
+          NEW_WEB_VERSION="${{ steps.versions.outputs.web_vault_tag }}"
+
+          echo "VPS 当前 server: $OLD_SERVER_VERSION"
+          echo "VPS 当前 web-vault: $OLD_WEB_VERSION"
+          echo "VPS 服务状态: $SERVICE_ACTIVE"
+          echo "最新 server: $NEW_SERVER_VERSION"
+          echo "最新 web-vault: $NEW_WEB_VERSION"
+
+          if [ "$NEW_SERVER_VERSION" = "$OLD_SERVER_VERSION" ] && \
+             [ "$NEW_WEB_VERSION" = "$OLD_WEB_VERSION" ] && \
+             [ "$SERVICE_ACTIVE" = "active" ]; then
+            echo "need_deploy=false" >> "$GITHUB_OUTPUT"
+            echo "版本没变化，跳过部署。"
+          else
+            echo "need_deploy=true" >> "$GITHUB_OUTPUT"
+            echo "需要部署。"
+          fi
+          
+  build-and-deploy:
+    needs: check-version
+    if: needs.check-version.outputs.need_deploy == 'true'
+    runs-on: ubuntu-latest
+
+    outputs:
+      deploy_duration_seconds: ${{ steps.deploy_duration.outputs.seconds }}
+      deploy_duration_text: ${{ steps.deploy_duration.outputs.text }}
+
+    steps:
+    
+      - name: 记录部署开始时间
+        id: deploy_start
+        run: |
+          echo "started_at=$(date +%s)" >> "$GITHUB_OUTPUT"
+    
+      - name: 拉取 Vaultwarden 上游 Release 源码
+        uses: actions/checkout@v4
+        with:
+          repository: dani-garcia/vaultwarden
+          ref: ${{ needs.check-version.outputs.vaultwarden_tag }}
+
+      - name: 在 Debian 12 环境里编译 Vaultwarden
         run: |
           set -e
 
@@ -41,7 +130,9 @@ jobs:
               . "$HOME/.cargo/env"
 
               cargo build --release --features sqlite
-              strip target/release/vaultwarden || true
+              if command -v strip >/dev/null 2>&1; then
+                strip target/release/vaultwarden || true
+              fi
             '
 
       - name: Download web-vault
@@ -53,16 +144,32 @@ jobs:
           cp target/release/vaultwarden release/vaultwarden
           chmod +x release/vaultwarden
 
-          WEB_TAG="$(curl -fsSL https://api.github.com/repos/dani-garcia/bw_web_builds/releases/latest | jq -r .tag_name)"
-          echo "Using web-vault release: $WEB_TAG"
-
           curl -fL \
             -o bw_web.tar.gz \
-            "https://github.com/dani-garcia/bw_web_builds/releases/download/${WEB_TAG}/bw_web_${WEB_TAG}.tar.gz"
+            "${{ needs.check-version.outputs.web_vault_url }}"
 
           tar -xzf bw_web.tar.gz -C release/web-vault
 
+          if [ -f release/web-vault/index.html ]; then
+            echo "web-vault 解压结构正常"
+          elif [ -f release/web-vault/web-vault/index.html ]; then
+            echo "检测到多了一层 web-vault，自动整理"
+            mv release/web-vault/web-vault/* release/web-vault/
+            rmdir release/web-vault/web-vault
+          else
+            echo "错误：没有找到 web-vault 的 index.html"
+            echo "release/web-vault 当前内容如下："
+            find release/web-vault -maxdepth 3 -print
+            exit 1
+          fi
+
+          echo "${{ needs.check-version.outputs.vaultwarden_tag }}" > release/.server_version
+          echo "${{ needs.check-version.outputs.web_vault_tag }}" > release/.web_vault_version
+
           tar -czf vaultwarden-native.tar.gz -C release .
+          
+          echo "打包内容预览："
+          tar -tzf vaultwarden-native.tar.gz | head -30
 
       - name: Prepare VPS directory
         uses: appleboy/ssh-action@v1.0.0
@@ -71,10 +178,12 @@ jobs:
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: ${{ secrets.SSH_PORT }}
+          protocol: tcp6
           script: |
             set -e
             mkdir -p /opt/vaultwarden
             mkdir -p /opt/vaultwarden/data
+            mkdir -p /opt/vaultwarden/releases
 
       - name: Upload package to VPS
         uses: appleboy/scp-action@master
@@ -83,6 +192,7 @@ jobs:
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: ${{ secrets.SSH_PORT }}
+          protocol: tcp6
           source: "vaultwarden-native.tar.gz"
           target: "/tmp/"
 
@@ -93,42 +203,95 @@ jobs:
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: ${{ secrets.SSH_PORT }}
+          protocol: tcp6
           script: |
             set -e
 
-            TARGET_DIR="/opt/vaultwarden"
-            SERVICE_NAME="vaultwarden"
-            VAULT_PORT="8080"
+            TARGET_DIR="${{ env.TARGET_DIR }}"
+            SERVICE_NAME="${{ env.SERVICE_NAME }}"
+            VAULT_PORT="${{ env.VAULT_PORT }}"
             VAULT_DOMAIN="${{ secrets.VAULT_DOMAIN }}"
 
+            NEW_SERVER_VERSION="${{ needs.check-version.outputs.vaultwarden_tag }}"
+            NEW_WEB_VERSION="${{ needs.check-version.outputs.web_vault_tag }}"
+            RELEASE_ID="${NEW_SERVER_VERSION}_${NEW_WEB_VERSION}"
+
+            RELEASES_DIR="$TARGET_DIR/releases"
+            CURRENT_LINK="$TARGET_DIR/current"
+            NEW_RELEASE_DIR="$RELEASES_DIR/$RELEASE_ID"
+
+            if [ -z "$VAULT_DOMAIN" ]; then
+              echo "VAULT_DOMAIN 不能为空。Secret 里只填域名，不要加 https://"
+              exit 1
+            fi
+            
             mkdir -p "$TARGET_DIR"
             mkdir -p "$TARGET_DIR/data"
-            mkdir -p /tmp/vaultwarden-release
+            mkdir -p "$RELEASES_DIR"
 
-            systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+            # 读取当前已经部署的 Vaultwarden 后端版本
+            # 如果文件不存在，就返回 none
+            OLD_SERVER_VERSION="$(cat "$TARGET_DIR/.deployed_version" 2>/dev/null || echo none)"
 
-            rm -rf /tmp/vaultwarden-release/*
-            tar -xzf /tmp/vaultwarden-native.tar.gz -C /tmp/vaultwarden-release
+            # 读取当前已经部署的 Web Vault 前端版本
+            # 如果文件不存在，就返回 none
+            OLD_WEB_VERSION="$(cat "$TARGET_DIR/.web_vault_version" 2>/dev/null || echo none)"
 
-            install -m 755 /tmp/vaultwarden-release/vaultwarden "$TARGET_DIR/vaultwarden"
+            # 如果 server 版本、web 版本都没变，
+            # current 目录里也有可执行文件，
+            # 并且服务正在运行，就跳过部署
+            if [ "$NEW_SERVER_VERSION" = "$OLD_SERVER_VERSION" ] && \
+               [ "$NEW_WEB_VERSION" = "$OLD_WEB_VERSION" ] && \
+               [ -x "$CURRENT_LINK/vaultwarden" ] && \
+               systemctl is-active --quiet "$SERVICE_NAME"; then
+              echo "当前已经是 server=$NEW_SERVER_VERSION web=$NEW_WEB_VERSION，跳过部署。"
+              exit 0
+            fi
+            # 记录当前版本目录
+            # 后面如果新版本启动失败，可以回滚到这里
+            PREVIOUS_RELEASE="$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)"
 
-            rm -rf "$TARGET_DIR/web-vault"
-            cp -a /tmp/vaultwarden-release/web-vault "$TARGET_DIR/web-vault"
+            # 删除可能已经存在的同名新版本目录，避免残留文件影响部署
+            rm -rf "$NEW_RELEASE_DIR"
 
+            # 创建本次新版本目录
+            mkdir -p "$NEW_RELEASE_DIR"
+
+            # 解压 GitHub Actions 上传到服务器的 Vaultwarden 压缩包
+            tar -xzf /tmp/vaultwarden-native.tar.gz -C "$NEW_RELEASE_DIR"
+
+            # 检查新版本目录里是否存在 vaultwarden 可执行文件
+            if [ ! -x "$NEW_RELEASE_DIR/vaultwarden" ]; then
+              echo "新版本里没有可执行的 vaultwarden 文件"
+              exit 1
+            fi
+
+            # 检查新版本目录里是否存在 web-vault 前端目录
+            if [ ! -d "$NEW_RELEASE_DIR/web-vault" ]; then
+              echo "新版本里没有 web-vault 目录"
+              exit 1
+            fi
+
+             # 确保 vaultwarden 文件有执行权限
+            chmod +x "$NEW_RELEASE_DIR/vaultwarden"
+
+            # 生成 Vaultwarden 的环境变量配置文件
             cat > /etc/vaultwarden.env << EOF
             ROCKET_ADDRESS=127.0.0.1
             ROCKET_PORT=$VAULT_PORT
-            ROCKET_WORKERS=3
+            ROCKET_WORKERS=2
 
             DATA_FOLDER=$TARGET_DIR/data
             WEB_VAULT_ENABLED=true
-            WEB_VAULT_FOLDER=$TARGET_DIR/web-vault
+            WEB_VAULT_FOLDER=$CURRENT_LINK/web-vault
 
             DOMAIN=https://$VAULT_DOMAIN
             SIGNUPS_ALLOWED=false
             INVITATIONS_ALLOWED=false
+            WEBSOCKET_ENABLED=false
             EOF
 
+            # 生成 systemd 服务文件
             cat > /etc/systemd/system/$SERVICE_NAME.service << EOF
             [Unit]
             Description=Vaultwarden
@@ -138,9 +301,9 @@ jobs:
             Type=simple
             User=root
             Group=root
-            WorkingDirectory=$TARGET_DIR
+            WorkingDirectory=$CURRENT_LINK
             EnvironmentFile=/etc/vaultwarden.env
-            ExecStart=$TARGET_DIR/vaultwarden
+            ExecStart=$CURRENT_LINK/vaultwarden
             Restart=always
             RestartSec=10
             LimitNOFILE=65535
@@ -151,10 +314,191 @@ jobs:
             WantedBy=multi-user.target
             EOF
 
-            systemctl daemon-reload
-            systemctl enable "$SERVICE_NAME"
-            systemctl restart "$SERVICE_NAME"
+            # 把 current 软链接切换到新版本目录
+            # 之后 systemd 会从 /opt/vaultwarden/current 启动新版本
+            ln -sfn "$NEW_RELEASE_DIR" "$CURRENT_LINK"
 
+            # 重新加载 systemd 配置
+            systemctl daemon-reload
+
+             # 设置 Vaultwarden 开机自启
+            systemctl enable "$SERVICE_NAME"
+
+            # 尝试重启服务
+            # 注意：这里不能让 systemctl restart 失败后直接退出，
+            # 否则下面的回滚逻辑不会执行
+            if systemctl restart "$SERVICE_NAME"; then
+              echo "服务重启命令执行成功。"
+            else
+              echo "服务重启命令执行失败，准备检查状态并尝试回滚。"
+            fi
+
+            # 等待 5 秒，让服务有时间启动
+            sleep 5
+            
+            # 检查服务是否启动成功
+            if systemctl is-active --quiet "$SERVICE_NAME"; then
+              # 启动成功后，记录当前已部署的 server 版本
+              echo "$NEW_SERVER_VERSION" > "$TARGET_DIR/.deployed_version"
+
+              # 启动成功后，记录当前已部署的 web vault 版本
+              echo "$NEW_WEB_VERSION" > "$TARGET_DIR/.web_vault_version"
+
+              # 输出部署成功信息
+              echo "部署成功：server=$NEW_SERVER_VERSION web=$NEW_WEB_VERSION"
+            else
+              # 如果新版本启动失败，输出错误信息
+              echo "新版本启动失败。"
+
+              # 如果之前存在旧版本目录，就尝试回滚
+              if [ -n "$PREVIOUS_RELEASE" ] && [ -d "$PREVIOUS_RELEASE" ]; then
+                echo "尝试回滚到：$PREVIOUS_RELEASE"
+
+                # 把 current 软链接切回旧版本
+                ln -sfn "$PREVIOUS_RELEASE" "$CURRENT_LINK"
+
+                # 尝试重启旧版本服务
+                systemctl restart "$SERVICE_NAME" || true
+              fi
+
+              # 打印服务状态，方便在 GitHub Actions 日志里排查错误
+              systemctl status "$SERVICE_NAME" --no-pager -l || true
+
+              # 让 GitHub Actions 标记这次部署失败
+              exit 1
+            fi
+
+            # 最后输出 Vaultwarden 服务状态
             systemctl status "$SERVICE_NAME" --no-pager -l
 
-            echo "✅ 部署完成！现在可以通过 http://$(hostname -I | awk '{print $1}') 访问 Vaultwarden"
+          
+      - name: 删除多余备份
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          protocol: tcp6
+          script: |
+            set -e
+
+            TARGET_DIR="${{ env.TARGET_DIR }}"
+            RELEASES_DIR="$TARGET_DIR/releases"
+            CURRENT_LINK="$TARGET_DIR/current"
+
+            # 只保留最近 2 个 release 目录，旧的删除
+            cd "$RELEASES_DIR"
+            
+            ls -1dt */ 2>/dev/null | tail -n +3 | while read -r old_release; do
+              old_path="$RELEASES_DIR/${old_release%/}"
+            
+              # 防止误删 current 当前指向的版本
+              if [ "$(readlink -f "$CURRENT_LINK")" != "$(readlink -f "$old_path")" ]; then
+                echo "删除旧版本：$old_path"
+                rm -rf "$old_path"
+              fi
+            done
+            
+      - name: 计算部署耗时
+        id: deploy_duration
+        if: always()
+        env:
+          STARTED_AT: ${{ steps.deploy_start.outputs.started_at }}
+        run: |
+          set -e
+
+          END_AT="$(date +%s)"
+
+          if [ -z "${STARTED_AT:-}" ]; then
+            echo "seconds=0" >> "$GITHUB_OUTPUT"
+            echo "text=unknown" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          USED_SECONDS=$((END_AT - STARTED_AT))
+          USED_MINUTES=$((USED_SECONDS / 60))
+          USED_REMAIN_SECONDS=$((USED_SECONDS % 60))
+
+          if [ "$USED_MINUTES" -gt 0 ]; then
+            DURATION_TEXT="${USED_MINUTES}分${USED_REMAIN_SECONDS}秒"
+          else
+            DURATION_TEXT="${USED_REMAIN_SECONDS}秒"
+          fi
+
+          echo "seconds=$USED_SECONDS" >> "$GITHUB_OUTPUT"
+          echo "text=$DURATION_TEXT" >> "$GITHUB_OUTPUT"
+
+          echo "本次部署耗时：$DURATION_TEXT"
+
+  notify:
+    needs: [check-version, build-and-deploy]
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 发送 Telegram 通知
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+          CHECK_RESULT: ${{ needs.check-version.result }}
+          NEED_DEPLOY: ${{ needs.check-version.outputs.need_deploy }}
+          DEPLOY_RESULT: ${{ needs.build-and-deploy.result }}
+          DEPLOY_DURATION: ${{ needs.build-and-deploy.outputs.deploy_duration_text }}
+
+          SERVER_VERSION: ${{ needs.check-version.outputs.vaultwarden_tag }}
+          WEB_VERSION: ${{ needs.check-version.outputs.web_vault_tag }}
+
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          SERVER_URL: ${{ github.server_url }}
+          WORKFLOW: ${{ github.workflow }}
+        run: |
+          set -e
+
+          if [ -z "${TG_BOT_TOKEN:-}" ] || [ -z "${TG_CHAT_ID:-}" ]; then
+            echo "未配置 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID，跳过通知。"
+            exit 0
+          fi
+
+          RUN_URL="$SERVER_URL/$REPO/actions/runs/$RUN_ID"
+
+          if [ "$CHECK_RESULT" != "success" ]; then
+            STATUS="❌ Vaultwarden 版本检查失败"
+          elif [ "$NEED_DEPLOY" != "true" ]; then
+            STATUS="🟡 Vaultwarden 无需部署"
+          elif [ "$DEPLOY_RESULT" = "success" ]; then
+            STATUS="✅ Vaultwarden 部署成功"
+          elif [ "$DEPLOY_RESULT" = "cancelled" ]; then
+            STATUS="⚠️ Vaultwarden 部署被取消"
+          else
+            STATUS="❌ Vaultwarden 部署失败"
+          fi
+
+          if [ "$NEED_DEPLOY" = "true" ]; then
+            DURATION_TEXT="${DEPLOY_DURATION:-unknown}"
+          else
+            DURATION_TEXT="未部署"
+          fi
+
+          TEXT="$(cat <<EOF
+          $STATUS
+
+          仓库：$REPO
+          工作流：$WORKFLOW
+          Server 版本：${SERVER_VERSION:-unknown}
+          Web Vault 版本：${WEB_VERSION:-unknown}
+          部署结果：${DEPLOY_RESULT:-unknown}
+          部署耗时：$DURATION_TEXT
+
+          日志：
+          $RUN_URL
+          EOF
+          )"
+
+          curl -fsS -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT_ID}" \
+            --data-urlencode "text=${TEXT}" \
+            --data-urlencode "disable_web_page_preview=true"
+            
