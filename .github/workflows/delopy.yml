@@ -152,8 +152,10 @@ jobs:
             echo "web-vault 解压结构正常"
           elif [ -f release/web-vault/web-vault/index.html ]; then
             echo "检测到多了一层 web-vault，自动整理"
+            shopt -s dotglob nullglob
             mv release/web-vault/web-vault/* release/web-vault/
-            rmdir release/web-vault/web-vault
+            shopt -u dotglob nullglob
+            rm -rf release/web-vault/web-vault
           else
             echo "错误：没有找到 web-vault 的 index.html"
             echo "release/web-vault 当前内容如下："
