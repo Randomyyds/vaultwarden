@@ -53,18 +53,57 @@ jobs:
 
       - name: 检查 VPS 当前版本
         id: check
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_USERNAME: ${{ secrets.SSH_USERNAME }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
         run: |
           set -euo pipefail
 
+          if [ -z "${SSH_PRIVATE_KEY:-}" ]; then
+            echo "SSH_PRIVATE_KEY 为空，请检查 GitHub Secrets"
+            exit 1
+          fi
+
+          if [ -z "${SSH_USERNAME:-}" ]; then
+            echo "SSH_USERNAME 为空，请检查 GitHub Secrets"
+            exit 1
+          fi
+
+          if [ -z "${SSH_HOST:-}" ]; then
+            echo "SSH_HOST 为空，请检查 GitHub Secrets"
+            exit 1
+          fi
+
+          SSH_PORT="${SSH_PORT:-22}"
+
+          if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]]; then
+            echo "SSH_PORT 必须是纯数字，例如 22"
+            exit 1
+          fi
+
+          echo "SSH_USERNAME 长度：${#SSH_USERNAME}"
+          echo "SSH_HOST 长度：${#SSH_HOST}"
+          echo "SSH_PORT：$SSH_PORT"
+
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
 
-          SSH_CMD="ssh -6 -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT }} -o StrictHostKeyChecking=no ${{ secrets.SSH_USERNAME }}@${{ secrets.SSH_HOST }}"
+          SSH_BASE=(
+            ssh
+            -6
+            -i ~/.ssh/deploy_key
+            -p "$SSH_PORT"
+            -o StrictHostKeyChecking=no
+            -o BatchMode=yes
+            "$SSH_USERNAME@$SSH_HOST"
+          )
 
-          OLD_SERVER_VERSION="$($SSH_CMD 'cat /opt/vaultwarden/.deployed_version 2>/dev/null || echo none')"
-          OLD_WEB_VERSION="$($SSH_CMD 'cat /opt/vaultwarden/.web_vault_version 2>/dev/null || echo none')"
-          SERVICE_ACTIVE="$($SSH_CMD 'systemctl is-active vaultwarden 2>/dev/null || true')"
+          OLD_SERVER_VERSION="$("${SSH_BASE[@]}" 'cat /opt/vaultwarden/.deployed_version 2>/dev/null || echo none')"
+          OLD_WEB_VERSION="$("${SSH_BASE[@]}" 'cat /opt/vaultwarden/.web_vault_version 2>/dev/null || echo none')"
+          SERVICE_ACTIVE="$("${SSH_BASE[@]}" 'systemctl is-active vaultwarden 2>/dev/null || true')"
 
           NEW_SERVER_VERSION="${{ steps.versions.outputs.vaultwarden_tag }}"
           NEW_WEB_VERSION="${{ steps.versions.outputs.web_vault_tag }}"
