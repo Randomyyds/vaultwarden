@@ -271,8 +271,9 @@ jobs:
           cat > /etc/vaultwarden.env << EOF
           ROCKET_ADDRESS=127.0.0.1
           ROCKET_PORT=$VAULT_PORT
-          ROCKET_WORKERS=2
+          ROCKET_WORKERS=3
 
+          
           DATA_FOLDER=$TARGET_DIR/data
           WEB_VAULT_ENABLED=true
           WEB_VAULT_FOLDER=$CURRENT_LINK/web-vault
@@ -280,7 +281,7 @@ jobs:
           DOMAIN=https://$VAULT_DOMAIN
           SIGNUPS_ALLOWED=false
           INVITATIONS_ALLOWED=false
-          WEBSOCKET_ENABLED=false
+          ENABLE_WEBSOCKET=true=true
           EOF
 
           # 生成 systemd 服务文件
