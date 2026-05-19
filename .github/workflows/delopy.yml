@@ -398,6 +398,7 @@ jobs:
           NEED_DEPLOY: ${{ needs.check-version.outputs.need_deploy }}
           BUILD_RESULT: ${{ needs.build-package.result }}
           DEPLOY_RESULT: ${{ needs.deploy.result }}
+          VERSION_RESULT: ${{ needs.get-versions.result }}
           
           FLOW_STARTED_AT: ${{ needs.get-versions.outputs.flow_started_at }}
         
@@ -418,10 +419,14 @@ jobs:
 
           RUN_URL="$SERVER_URL/$REPO/actions/runs/$RUN_ID"
 
-          if [ "$CHECK_RESULT" != "success" ]; then
-            STATUS="❌ Vaultwarden 版本检查失败"
+          if [ "$VERSION_RESULT" != "success" ]; then
+            STATUS="❌ Vaultwarden 最新版本获取失败"
+          elif [ "$CHECK_RESULT" != "success" ]; then
+            STATUS="❌ Vaultwarden VPS 版本检查失败"
           elif [ "$NEED_DEPLOY" != "true" ]; then
             STATUS="🟡 Vaultwarden 无需部署"
+          elif [ "$BUILD_RESULT" != "success" ]; then
+            STATUS="❌ Vaultwarden 编译失败"
           elif [ "$DEPLOY_RESULT" = "success" ]; then
             STATUS="✅ Vaultwarden 部署成功"
           elif [ "$DEPLOY_RESULT" = "cancelled" ]; then
@@ -455,7 +460,7 @@ jobs:
           Web Vault 版本：${WEB_VERSION:-unknown}
           构建结果：${BUILD_RESULT:-unknown}
           部署结果：${DEPLOY_RESULT:-unknown}
-          总耗时：$DURATION_TEXT
+          总耗时：$TOTAL_DURATION_TEXT
 
           日志：
           $RUN_URL
