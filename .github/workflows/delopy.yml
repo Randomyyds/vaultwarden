@@ -33,7 +33,7 @@ jobs:
       - name: Upload binary to VPS
         uses: appleboy/scp-action@master
         with:
-          host: "[${{ secrets.SSH_HOST }}]"
+          host: "[2400:cca0:100:413::]"
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: ${{ secrets.SSH_PORT }}
@@ -44,7 +44,7 @@ jobs:
       - name: Setup Vaultwarden + Nginx and restart
         uses: appleboy/ssh-action@v1.0.0
         with:
-          host: ${{ secrets.SSH_HOST }}
+          host: "[2400:cca0:100:413::]"
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: ${{ secrets.SSH_PORT }}
